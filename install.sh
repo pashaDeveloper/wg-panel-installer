@@ -97,16 +97,22 @@ configure_firewall() {
   printf 'Cloud/provider firewall: allow TCP %s and UDP %s-%s.\n' "$panel_port" "$wg_port" "$wg_end"
 }
 
-main() {
+install_panel() {
   [[ ${EUID} == 0 ]] || fail 'Run with sudo bash install.sh.'
   [[ -r /dev/tty ]] || fail 'Run from an interactive SSH terminal.'
   config_dir=/etc/wg-panel
   install_dir=/opt/wg-panel
-  [[ ! -e $install_dir ]] || fail "$install_dir already exists. Use the update instructions in README; existing data was not changed."
+  if [[ -x $config_dir/compose && -f $install_dir/docker-compose.private.yml ]]; then
+    printf 'Existing installation found. Starting it with its saved settings.\n'
+    "$config_dir/compose" up -d --wait --wait-timeout 180
+    return
+  fi
+  [[ ! -e $install_dir ]] || fail "$install_dir contains an incomplete installation. Check it before retrying."
   printf 'Private WireGuard panel installer — Ubuntu / Debian\n'
-  ask repository 'Private GitHub repository (OWNER/REPO): '
+  repository=pashaDeveloper/wg-pasha-master
+  branch=''
+  printf 'Private repository: %s (default branch)\n' "$repository"
   [[ $repository =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ && $repository != */.. && $repository != */. ]] || fail 'Use OWNER/REPO, not a URL.'
-  ask branch 'Branch or tag (blank = repository default branch): '
   [[ -z $branch || ( $branch != -* && $branch != *[[:space:]]* ) ]] || fail 'Invalid branch/tag.'
   ask panel_port 'Panel TCP port [51821]: '
   panel_port=${panel_port:-51821}
@@ -168,7 +174,158 @@ main() {
   fail 'Container started, but the panel did not respond. Run sudo /etc/wg-panel/compose logs --tail 100.'
 }
 
+require_panel() {
+  [[ -x $config_dir/compose && -f $config_dir/panel.env ]] || fail 'Install the panel first (option 1).'
+}
+
+setting() {
+  # Read only simple, non-secret fields written by this installer; never source dotenv.
+  local entry
+  entry=$(grep -m1 "^$1=" "$config_dir/panel.env") || return 1
+  entry=${entry#*=}
+  entry=${entry#\'}
+  entry=${entry%\'}
+  printf '%s' "$entry"
+}
+
+ssl_compose() {
+  docker compose --project-name wg-panel-ssl -f "$config_dir/ssl/compose.yml" "$@"
+}
+
+valid_domain() {
+  [[ ${#1} -le 253 && $1 == *.* && $1 != *..* && ! $1 =~ ^[0-9.]+$ && $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+}
+
+receive_ssl() {
+  require_panel
+  local domain ready port code attempt
+  port=$(setting PANEL_PORT)
+  valid_port "$port" || fail 'Invalid PANEL_PORT in panel.env.'
+  [[ $port != 80 && $port != 443 ]] || fail 'Move the panel HTTP port away from 80/443 before enabling SSL.'
+  ask domain 'Domain pointing to this server (example: panel.example.com): '
+  valid_domain "$domain" || fail 'Enter a DNS domain without a scheme, port or path.'
+  printf 'Point the domain A record (and any AAAA record) to this server. Allow inbound TCP 80 and 443 in the provider firewall.\n'
+  ask ready 'DNS and firewall ready? Type YES to continue: '
+  [[ $ready == YES ]] || { printf 'Cancelled.\n'; return; }
+  if [[ ! -f $config_dir/ssl/compose.yml ]]; then
+    for port in 80 443; do
+      if ss -H -ltn "sport = :$port" | grep -q .; then fail "TCP $port is occupied. Existing web services were not changed."; fi
+    done
+  fi
+  port=$(setting PANEL_PORT)
+  install -d -m 0700 "$config_dir/ssl"
+  printf '%s {\n  reverse_proxy 127.0.0.1:%s\n}\n' "$domain" "$port" >"$config_dir/ssl/Caddyfile"
+  cat >"$config_dir/ssl/compose.yml" <<'SSL'
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  caddy_data:
+  caddy_config:
+SSL
+  ssl_compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+  if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    for port in 80 443; do
+      firewall-cmd --permanent --add-port="$port/tcp"
+      firewall-cmd --add-port="$port/tcp"
+    done
+  fi
+  ssl_compose up -d --force-recreate
+  printf '%s\n' "$domain" >"$config_dir/ssl/domain"
+  printf 'Waiting for a trusted HTTPS certificate...\n'
+  for ((attempt = 0; attempt < 30; attempt++)); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --resolve "$domain:443:127.0.0.1" --max-time 5 "https://$domain/") || code=000
+    case "$code" in 200|302|303|307|308)
+      printf 'HTTPS ready: https://%s/ (use your saved panel path, if changed).\nCertificates renew automatically while Caddy runs.\n' "$domain"
+      return ;;
+    esac
+    sleep 2
+  done
+  printf 'HTTPS is not ready. Check DNS, inbound 80/443 and these logs:\n'
+  ssl_compose logs --tail 30
+  fail 'Certificate or upstream verification failed. Fix the issue and retry option 2.'
+}
+
+panel_information() {
+  require_panel
+  printf 'Repository: pashaDeveloper/wg-pasha-master\n'
+  printf 'HTTP address: http://%s:%s/\n' "$(setting INIT_HOST)" "$(setting PANEL_PORT)"
+  printf 'Initial administrator: %s\n' "$(setting INIT_USERNAME)"
+  printf 'WireGuard UDP ports: %s-%s\n' "$(setting WG_PORT)" "$(setting WG_PORT_END || setting WG_PORT)"
+  if [[ -f $config_dir/ssl/domain ]]; then
+    printf 'Configured HTTPS address: https://%s/\n' "$(cat "$config_dir/ssl/domain")"
+    ssl_compose ps
+  fi
+  printf 'Use the saved panel path if changed. Passwords and private keys are not displayed.\n'
+  "$config_dir/compose" ps
+}
+
+remove_panel() {
+  require_panel
+  local confirmation purge
+  ask confirmation 'Stop and remove panel containers? Type REMOVE to confirm: '
+  [[ $confirmation == REMOVE ]] || { printf 'Cancelled.\n'; return; }
+  ask purge 'Also permanently delete all users, settings, certificates, source and Deploy Key? Type DELETE DATA, or Enter to keep data: '
+  if [[ $purge == 'DELETE DATA' ]]; then
+    [[ $config_dir == /etc/wg-panel && $install_dir == /opt/wg-panel && ! -L $config_dir && ! -L $install_dir ]] || fail 'Unexpected installation paths.'
+    if [[ -f $config_dir/ssl/compose.yml ]]; then ssl_compose down --volumes; fi
+    "$config_dir/compose" down --volumes
+    rm -rf -- /opt/wg-panel /etc/wg-panel
+    printf 'Panel and its data removed. Remove its Deploy Key entry in GitHub if no longer needed.\n'
+  else
+    if [[ -f $config_dir/ssl/compose.yml ]]; then ssl_compose down; fi
+    "$config_dir/compose" down
+    printf 'Containers removed. Data and settings kept. Option 1 starts the panel again; option 2 starts HTTPS.\n'
+  fi
+  printf 'Docker and shared firewall rules were kept.\n'
+}
+
+run_tunnel() {
+  printf 'Tunnel setup is not configured yet. This option is reserved for a future update.\n'
+}
+
+run_action() {
+  local status
+  # A separate shell preserves errexit inside actions and returns to the menu on failure.
+  trap ':' INT
+  set +e
+  (set -e; trap 'exit 130' INT; "$1")
+  status=$?
+  set -e
+  trap - INT
+  if (( status != 0 && status != 130 )); then printf 'Action failed (exit %s). Review the message above.\n' "$status"; fi
+}
+
+main() {
+  [[ ${EUID} == 0 ]] || fail 'Run with sudo bash install.sh.'
+  [[ -r /dev/tty ]] || fail 'Run from an interactive SSH terminal.'
+  config_dir=/etc/wg-panel
+  install_dir=/opt/wg-panel
+  local choice
+  while true; do
+    printf '\n1. Install panel\n2. Receive SSL certificate\n3. Panel information\n4. Remove panel\n5. Run tunnel\nq) Exit\n'
+    ask choice 'Select an option: '
+    case "$choice" in
+      1) run_action install_panel ;;
+      2) run_action receive_ssl ;;
+      3) run_action panel_information ;;
+      4) run_action remove_panel ;;
+      5) run_action run_tunnel ;;
+      q|Q) return ;;
+      *) printf 'Invalid option.\n' ;;
+    esac
+  done
+}
+
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-  trap 'printf "Installation stopped at line %s. Existing files and volumes were preserved.\n" "$LINENO" >&2' ERR
   main "$@"
 fi
