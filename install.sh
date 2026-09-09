@@ -48,35 +48,15 @@ install_dependencies() {
 }
 
 prepare_key() {
-  local mode key_source line pubkey registered
+  local pubkey registered
   key_file="$config_dir/deploy_key"
-  if [[ -e $key_file ]]; then
-    printf 'Using existing deploy key: %s\n' "$key_file"
-  else
-    ask mode 'Deploy Key: [1] generate on server (recommended), [2] existing private-key file, [3] paste private key [1]: '
-    case "${mode:-1}" in
-      1) ssh-keygen -q -t ed25519 -N '' -C 'wg-panel-deploy' -f "$key_file" ;;
-      2)
-        ask key_source 'Absolute path to the PRIVATE key file: '
-        [[ $key_source == /* && -f $key_source ]] || fail 'Private-key file not found.'
-        install -m 0600 -- "$key_source" "$key_file"
-        ;;
-      3)
-        printf 'Paste the complete PRIVATE key, then type END on a new line. Input is hidden.\n'
-        : >"$key_file"
-        while true; do
-          secret line ''
-          [[ $line == END ]] && break
-          printf '%s\n' "${line%$'\r'}" >>"$key_file"
-        done
-        ;;
-      *) fail 'Invalid Deploy Key option.' ;;
-    esac
+  if [[ ! -e $key_file ]]; then
+    ssh-keygen -q -t ed25519 -N '' -C 'wg-panel-deploy' -f "$key_file"
   fi
   chmod 0600 "$key_file"
   pubkey=$(ssh-keygen -y -P '' -f "$key_file") || fail "Use an unencrypted deploy key. Replace $key_file and rerun."
   printf '\nAdd this PUBLIC key to https://github.com/%s/settings/keys\n' "$repository"
-  printf 'Settings > Deploy keys > Add deploy key. Leave Allow write access OFF.\n\n%s\n\n' "$pubkey"
+  printf 'Settings > Deploy keys > Add deploy key. Leave Allow write access OFF.\n\n\033[1;31m%s\033[0m\n\n' "$pubkey"
   ask registered 'Press Enter after adding the public key to the PRIVATE repository: '
   # Pinned GitHub host key, from GitHub SSH fingerprint documentation.
   printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >"$config_dir/known_hosts"
@@ -97,14 +77,50 @@ configure_firewall() {
   printf 'Cloud/provider firewall: allow TCP %s and UDP %s-%s.\n' "$panel_port" "$wg_port" "$wg_end"
 }
 
+detect_public_ip() {
+  local address service octet
+  local -a octets
+  for service in https://api.ipify.org https://checkip.amazonaws.com; do
+    address=$(curl -4fsS --connect-timeout 5 --max-time 10 "$service") || continue
+    [[ $address =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || continue
+    IFS=. read -r -a octets <<<"$address"
+    for octet in "${octets[@]}"; do
+      (( 10#$octet <= 255 )) || continue 2
+    done
+    printf '%s' "$address"
+    return
+  done
+  return 1
+}
+
+prepare_runtime() {
+  # Preserve Compose variables so later panel.env port changes still work.
+  sed '/^    build: \.$/d' "$install_dir/docker-compose.private.yml" >"$config_dir/runtime.compose.yml"
+  if grep -Eq '^[[:space:]]*build:' "$config_dir/runtime.compose.yml"; then
+    fail 'Unsupported Compose build section; source was preserved.'
+  fi
+  chmod 0600 "$config_dir/runtime.compose.yml"
+  printf '#!/usr/bin/env bash\nset -euo pipefail\ncd /etc/wg-panel\nexec docker compose --project-name wg-panel --env-file /etc/wg-panel/panel.env -f runtime.compose.yml "$@"\n' >"$config_dir/compose"
+  chmod 0700 "$config_dir/compose"
+  "$config_dir/compose" config --quiet
+}
+
+cleanup_source() {
+  [[ $install_dir == /opt/wg-panel && ! -L $install_dir && -f $config_dir/runtime.compose.yml && -x $config_dir/compose ]] || fail 'Source cleanup safety check failed.'
+  rm -rf -- /opt/wg-panel
+  printf 'Downloaded source folder removed. Runtime configuration and panel data were kept.\n'
+}
+
 install_panel() {
   [[ ${EUID} == 0 ]] || fail 'Run with sudo bash install.sh.'
   [[ -r /dev/tty ]] || fail 'Run from an interactive SSH terminal.'
   config_dir=/etc/wg-panel
   install_dir=/opt/wg-panel
-  if [[ -x $config_dir/compose && -f $install_dir/docker-compose.private.yml ]]; then
+  if [[ -x $config_dir/compose && -f $config_dir/panel.env && ( -f $config_dir/runtime.compose.yml || -f $install_dir/docker-compose.private.yml ) ]]; then
     printf 'Existing installation found. Starting it with its saved settings.\n'
+    if [[ ! -f $config_dir/runtime.compose.yml ]]; then prepare_runtime; fi
     "$config_dir/compose" up -d --wait --wait-timeout 180
+    cleanup_source
     return
   fi
   [[ ! -e $install_dir ]] || fail "$install_dir contains an incomplete installation. Check it before retrying."
@@ -117,25 +133,13 @@ install_panel() {
   ask panel_port 'Panel TCP port [51821]: '
   panel_port=${panel_port:-51821}
   valid_port "$panel_port" || fail 'Port must be 1-65535.'
-  ask endpoint 'Server public IPv4 address or DNS name (no http:// or path): '
-  [[ $endpoint =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || fail 'Enter a public IPv4 address or DNS name.'
-  ask wg_port 'First WireGuard UDP port [51820]: '
-  wg_port=${wg_port:-51820}
-  valid_port "$wg_port" || fail 'Invalid WireGuard port.'
-  ask wg_end "Last WireGuard UDP port [$((wg_port + 100 > 65535 ? 65535 : wg_port + 100))]: "
-  wg_end=${wg_end:-$((wg_port + 100 > 65535 ? 65535 : wg_port + 100))}
-  valid_port "$wg_end" && (( wg_end >= wg_port )) || fail 'Invalid UDP range.'
-  ask username 'Panel administrator username [admin]: '
-  username=${username:-admin}
-  [[ $username =~ ^[A-Za-z0-9_.-]{2,64}$ ]] || fail 'Use 2-64 letters, numbers, dots, underscores or hyphens.'
-  case "$username" in __proto__|constructor|prototype) fail 'Choose a different username.' ;; esac
-  secret password 'Panel administrator password (at least 12 characters): '
-  (( ${#password} >= 12 )) || fail 'Password must have at least 12 characters.'
-  secret confirmation 'Repeat password: '
-  [[ $password == "$confirmation" ]] || fail 'Passwords do not match.'
-  unset confirmation
-
   install_dependencies
+  endpoint=$(detect_public_ip) || fail 'Could not detect public IPv4. Check outbound HTTPS and retry.'
+  printf 'Detected server address: %s\n' "$endpoint"
+  wg_port=51820
+  wg_end=51920
+  username=admin
+  password=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
   if ss -H -ltn "sport = :$panel_port" | grep -q .; then fail 'Panel TCP port is already in use.'; fi
   install -d -m 0700 "$config_dir"
   prepare_key
@@ -151,7 +155,6 @@ install_panel() {
     env_line INIT_USERNAME "$username"
     env_line INIT_PASSWORD "$password"
   } >"$config_dir/panel.env"
-  unset password
   chmod 0600 "$config_dir/panel.env"
   # Keep credentials outside the clone and Docker build context.
   printf '#!/usr/bin/env bash\nset -euo pipefail\ncd /opt/wg-panel\nexec docker compose --project-name wg-panel --env-file /etc/wg-panel/panel.env -f docker-compose.private.yml "$@"\n' >"$config_dir/compose"
@@ -159,6 +162,7 @@ install_panel() {
   git -C "$install_dir" config core.sshCommand "$GIT_SSH_COMMAND"
   "$config_dir/compose" config --quiet
   "$config_dir/compose" build
+  prepare_runtime
   configure_firewall
   "$config_dir/compose" up -d --force-recreate --wait --wait-timeout 180
   local code attempt
@@ -166,6 +170,9 @@ install_panel() {
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$panel_port/") || code=000
     case "$code" in 200|302|303|307|308)
       printf '\nInstalled: http://%s:%s/\nUsername: %s\n' "$endpoint" "$panel_port" "$username"
+      printf 'Password: %s\nSave these login details.\n' "$password"
+      unset password
+      cleanup_source
       printf 'Manage: sudo /etc/wg-panel/compose ps\nLogs: sudo /etc/wg-panel/compose logs --tail 100\n'
       return 0 ;;
     esac
