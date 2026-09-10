@@ -138,8 +138,6 @@ install_panel() {
   printf 'Detected server address: %s\n' "$endpoint"
   wg_port=51820
   wg_end=51920
-  username=admin
-  password=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
   if ss -H -ltn "sport = :$panel_port" | grep -q .; then fail 'Panel TCP port is already in use.'; fi
   install -d -m 0700 "$config_dir"
   prepare_key
@@ -152,11 +150,9 @@ install_panel() {
     env_line INIT_HOST "$endpoint"
     env_line WG_PORT "$wg_port"
     env_line WG_PORT_END "$wg_end"
-    env_line INIT_USERNAME "$username"
-    env_line INIT_PASSWORD "$password"
   } >"$config_dir/panel.env"
   chmod 0600 "$config_dir/panel.env"
-  # Keep credentials outside the clone and Docker build context.
+  # Keep runtime settings outside the clone and Docker build context.
   printf '#!/usr/bin/env bash\nset -euo pipefail\ncd /opt/wg-panel\nexec docker compose --project-name wg-panel --env-file /etc/wg-panel/panel.env -f docker-compose.private.yml "$@"\n' >"$config_dir/compose"
   chmod 0700 "$config_dir/compose"
   git -C "$install_dir" config core.sshCommand "$GIT_SSH_COMMAND"
@@ -169,9 +165,9 @@ install_panel() {
   for ((attempt = 0; attempt < 30; attempt++)); do
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$panel_port/") || code=000
     case "$code" in 200|302|303|307|308)
-      printf '\nInstalled: http://%s:%s/\nUsername: %s\n' "$endpoint" "$panel_port" "$username"
-      printf 'Password: %s\nSave these login details.\n' "$password"
-      unset password
+      printf '\nInstalled: http://%s:%s/\n' "$endpoint" "$panel_port"
+      printf 'Open this address to create your administrator account and complete setup.\n'
+      printf 'WireGuard setup: server address %s, UDP port %s.\n' "$endpoint" "$wg_port"
       cleanup_source
       printf 'Manage: sudo /etc/wg-panel/compose ps\nLogs: sudo /etc/wg-panel/compose logs --tail 100\n'
       return 0 ;;
@@ -266,7 +262,7 @@ panel_information() {
   require_panel
   printf 'Repository: pashaDeveloper/wg-pasha-master\n'
   printf 'HTTP address: http://%s:%s/\n' "$(setting INIT_HOST)" "$(setting PANEL_PORT)"
-  printf 'Initial administrator: %s\n' "$(setting INIT_USERNAME)"
+  printf 'Administrator accounts are managed in the panel. On a fresh installation, open the panel to create the first account.\n'
   printf 'WireGuard UDP ports: %s-%s\n' "$(setting WG_PORT)" "$(setting WG_PORT_END || setting WG_PORT)"
   if [[ -f $config_dir/ssl/domain ]]; then
     printf 'Configured HTTPS address: https://%s/\n' "$(cat "$config_dir/ssl/domain")"
