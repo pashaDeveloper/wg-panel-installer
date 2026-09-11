@@ -28,7 +28,11 @@ install_dependencies() {
   source /etc/os-release
   case "$ID" in ubuntu|debian) ;; *) fail 'Supported servers: Ubuntu or Debian.' ;; esac
   command -v systemctl >/dev/null || fail 'A systemd server is required.'
+  printf 'Updating package lists and upgrading server packages before panel installation...\n'
   apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold
   apt-get install -y ca-certificates curl git openssh-client iproute2
   if ! command -v docker >/dev/null; then
     if { dpkg-query -W -f='${Status}\n' docker.io containerd podman-docker 2>/dev/null || true; } | grep -q 'install ok installed'; then
