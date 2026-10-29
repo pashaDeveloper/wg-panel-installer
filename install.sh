@@ -504,7 +504,11 @@ update_panel() (
   git clone --depth 1 git@github.com:pashaDeveloper/wg-pasha-master.git "$source_dir"
   revision=$(git -C "$source_dir" rev-parse HEAD)
   [[ $revision =~ ^[a-f0-9]{40,64}$ ]] || fail 'Invalid source revision.'
-  [[ -f $source_dir/Dockerfile && -f $source_dir/public-installer/install.sh ]] || fail 'The private repository is missing deployment files.'
+  # The public installer is published separately and is not part of the private source.
+  local required_file
+  for required_file in Dockerfile src/package.json src/launcher.mjs; do
+    [[ -f $source_dir/$required_file ]] || fail "Private repository revision $revision is missing $required_file. Push the panel source to the default branch."
+  done
   local container current
   container=$("$config_dir/compose" ps -q wg-easy)
   [[ -n $container ]] || fail 'Start the existing panel before updating.'
@@ -532,9 +536,13 @@ update_panel() (
   switched=1
   "$config_dir/compose" up -d --force-recreate --wait --wait-timeout 180
   "$config_dir/compose" exec -T wg-easy node --input-type=module -e 'import {applyPanelSettings,readPanelSettings} from "/app/launcher.mjs";applyPanelSettings(readPanelSettings("/etc/wireguard/wg-easy.db"),process.env);const http=await import(process.env.PANEL_TLS_ACTIVE === "true"?"node:https":"node:http");const r=http.get({hostname:"127.0.0.1",port:process.env.PORT,path:process.env.NUXT_APP_BASE_URL,rejectUnauthorized:false},res=>process.exit([200,301,302,303,307,308].includes(res.statusCode)?0:1));r.setTimeout(10000,()=>{r.destroy();process.exit(1)});r.on("error",()=>process.exit(1));'
-  # Refresh the host updater only after the new panel has passed its checks.
-  install -m 0700 "$source_dir/public-installer/install.sh" "$config_dir/updater.sh.new"
-  mv -f "$config_dir/updater.sh.new" "$config_dir/updater.sh"
+  # Older private repositories may bundle the installer; otherwise keep the host copy.
+  # Refresh it only after the new panel has passed its checks.
+  if [[ -f $source_dir/public-installer/install.sh ]]; then
+    bash -n "$source_dir/public-installer/install.sh"
+    install -m 0700 "$source_dir/public-installer/install.sh" "$config_dir/updater.sh.new"
+    mv -f "$config_dir/updater.sh.new" "$config_dir/updater.sh"
+  fi
   stopped=0
   update_status succeeded
   printf 'Panel updated to %s. Backup: %s\n' "$revision" "$backup_dir"
@@ -1337,6 +1345,31 @@ udp2raw_menu() {
 
 # END UDP2RAW HOST SUPPORT
 
+reset_panel_password() {
+  [[ -x $config_dir/compose ]] || fail 'Install the panel first.'
+  local username password confirmation
+  ask username 'Administrator username (blank = main admin): '
+  secret password 'New password (12-256 characters): '
+  secret confirmation 'Repeat new password: '
+  [[ $password == "$confirmation" ]] || fail 'Passwords do not match.'
+  (( ${#password} >= 12 && ${#password} <= 256 )) || fail 'Use 12-256 characters.'
+  local args=(db:admin:reset --password-stdin)
+  [[ -z $username ]] || args+=(--username "$username")
+  printf '%s' "$password" | "$config_dir/compose" exec -T wg-easy /usr/local/bin/cli "${args[@]}"
+  unset password confirmation
+  printf 'Password recovery completed. TOTP was reset for this account.\n'
+}
+
+update_menu() {
+  local selection
+  printf '\n1. Update panel from GitHub\n2. Recover/change administrator password\nb) Back\n'
+  ask selection 'Select: '
+  case "$selection" in
+    1) update_panel ;; 2) reset_panel_password ;; b|B) return ;;
+    *) printf 'Invalid option.\n' ;;
+  esac
+}
+
 run_action() {
   local status
   # A separate shell preserves errexit inside actions and returns to the menu on failure.
@@ -1356,14 +1389,15 @@ main() {
   install_dir=/opt/wg-panel
   local choice
   while true; do
-    printf '\n1. Install panel\n2. Edit panel\n3. Remove panel\n4. Update panel from GitHub\n5. WireGuard UDP tunnels\nq) Exit\n'
+    printf '\n1. Install panel\n2. Edit panel\n3. Remove panel\n4. Update panel / recover password\n5. WireGuard UDP tunnels\n6. Recover/change administrator password\nq) Exit\n'
     ask choice 'Select an option: '
     case "$choice" in
       1) run_action install_panel ;;
       2) run_action edit_panel ;;
       3) run_action remove_panel ;;
-      4) run_action update_panel ;;
+      4) run_action update_menu ;;
       5) run_action tunnel_menu ;;
+      6) run_action reset_panel_password ;;
       q|Q) return ;;
       *) printf 'Invalid option.\n' ;;
     esac
