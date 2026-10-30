@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Public bootstrap only. Never put a private key or panel source in this repo.
+# Installer maintained in the main panel repository. Never embed private keys.
 set -Eeuo pipefail
 set +x
 umask 077
+
+readonly PANEL_REPOSITORY='pashaDeveloper/wg-pasha-master'
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 ask() {
@@ -59,11 +61,15 @@ prepare_key() {
   fi
   chmod 0600 "$key_file"
   pubkey=$(ssh-keygen -y -P '' -f "$key_file") || fail "Use an unencrypted deploy key. Replace $key_file and rerun."
-  printf '\nAdd this PUBLIC key to https://github.com/%s/settings/keys\n' "$repository"
-  printf 'Settings > Deploy keys > Add deploy key. Leave Allow write access OFF.\n\n\033[1;31m%s\033[0m\n\n' "$pubkey"
   # Pinned GitHub host key, from GitHub SSH fingerprint documentation.
   printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >"$config_dir/known_hosts"
   export GIT_SSH_COMMAND="ssh -F /dev/null -i $key_file -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$config_dir/known_hosts -o HostKeyAlgorithms=ssh-ed25519"
+  if git ls-remote "git@github.com:$repository.git" HEAD >/dev/null 2>&1; then
+    printf 'Deploy Key access verified. Continuing installation.\n'
+    return
+  fi
+  printf '\nAdd this PUBLIC key to https://github.com/%s/settings/keys\n' "$repository"
+  printf 'Settings > Deploy keys > Add deploy key. Leave Allow write access OFF.\n\n\033[1;31m%s\033[0m\n\n' "$pubkey"
   while true; do
     ask registered '[C] Copy public key | [Enter] Check GitHub access | [Q] Cancel: '
     case "$registered" in
@@ -138,19 +144,32 @@ install_panel() {
   config_dir=/etc/wg-panel
   install_dir=/opt/wg-panel
   if [[ -x $config_dir/compose && -f $config_dir/panel.env && ( -f $config_dir/runtime.compose.yml || -f $install_dir/docker-compose.private.yml ) ]]; then
-    printf 'Existing installation found. Starting it with its saved settings.\n'
+    printf 'Existing installation found. Downloading the latest source and reinstalling with the saved settings.\n'
     if [[ ! -f $config_dir/runtime.compose.yml ]]; then
-      "$config_dir/compose" build
+      # A previous build may have failed. Preserve its deployment settings,
+      # but never build its stale checkout again.
       prepare_runtime
     fi
-    setup_updater
-    "$config_dir/compose" up -d --wait --wait-timeout 180
-    cleanup_source
+    local reinstall_port saved_panel_port
+    saved_panel_port=$(setting PANEL_PORT)
+    ask reinstall_port "Panel TCP port [$saved_panel_port]: "
+    reinstall_port=${reinstall_port:-$saved_panel_port}
+    valid_port "$reinstall_port" || fail 'Port must be 1-65535.'
+    if [[ $reinstall_port != "$saved_panel_port" ]] && ss -H -ltn "sport = :$reinstall_port" | grep -q .; then
+      fail 'Panel TCP port is already in use.'
+    fi
+    update_panel --reinstall
+    if [[ $reinstall_port != "$saved_panel_port" ]]; then
+      # Apply through the existing port-change path so HTTPS and rollback are
+      # handled consistently, including recovery when no image existed before.
+      edit_panel_port "$reinstall_port"
+    fi
+    if [[ -d $install_dir && ! -L $install_dir ]]; then cleanup_source; fi
     return
   fi
   [[ ! -e $install_dir ]] || fail "$install_dir contains an incomplete installation. Check it before retrying."
   printf 'Private WireGuard panel installer — Ubuntu / Debian\n'
-  repository=pashaDeveloper/wg-pasha-master
+  repository=$PANEL_REPOSITORY
   branch=''
   printf 'Private repository: %s (default branch)\n' "$repository"
   [[ $repository =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ && $repository != */.. && $repository != */. ]] || fail 'Use OWNER/REPO, not a URL.'
@@ -206,6 +225,23 @@ install_panel() {
 require_panel() {
   [[ -x $config_dir/compose && -f $config_dir/panel.env ]] || fail 'Install the panel first (option 1).'
 }
+
+restart_panel() (
+  require_panel
+  exec 9>"$config_dir/update.lock"
+  flock -n 9 || fail 'An update or edit is already running.'
+  printf 'Restarting the panel. VPN connections may briefly disconnect.\n'
+  if ! "$config_dir/compose" up -d --no-build --pull never --force-recreate --wait --wait-timeout 180 wg-easy; then
+    "$config_dir/compose" ps --all || true
+    "$config_dir/compose" logs --tail 50 wg-easy || true
+    fail 'Panel restart failed. Review the error and logs above.'
+  fi
+  if [[ -f $config_dir/ssl/compose.yml ]]; then
+    ssl_compose up -d --pull never --force-recreate
+  fi
+  "$config_dir/compose" ps
+  printf 'Panel restarted. Settings and VPN data were kept.\n'
+)
 
 setting() {
   # Read only simple, non-secret fields written by this installer; never source dotenv.
@@ -286,7 +322,7 @@ SSL
 
 panel_information() {
   require_panel
-  printf 'Repository: pashaDeveloper/wg-pasha-master\n'
+  printf 'Repository: %s\n' "$PANEL_REPOSITORY"
   printf 'HTTP address: http://%s:%s/\n' "$(setting INIT_HOST)" "$(setting PANEL_PORT)"
   printf 'Administrator accounts are managed in the panel. On a fresh installation, open the panel to create the first account.\n'
   printf 'WireGuard UDP ports: %s-%s\n' "$(setting WG_PORT)" "$(setting WG_PORT_END || setting WG_PORT)"
@@ -306,6 +342,11 @@ remove_panel() {
   ask purge 'Also permanently delete all users, settings, certificates, source and Deploy Key? Type DELETE DATA, or Enter to keep data: '
   if [[ $purge == 'DELETE DATA' ]]; then
     [[ $config_dir == /etc/wg-panel && $install_dir == /opt/wg-panel && ! -L $config_dir && ! -L $install_dir ]] || fail 'Unexpected installation paths.'
+    if [[ -f /etc/systemd/system/wg-panel-apply.path ]]; then
+      systemctl disable --now wg-panel-apply.path
+      systemctl stop wg-panel-apply.service
+      rm -f /etc/systemd/system/wg-panel-apply.path /etc/systemd/system/wg-panel-apply.service
+    fi
     if [[ -f /etc/systemd/system/wg-panel-update.path ]]; then
       if [[ -f /etc/systemd/system/wg-panel-update-check.timer ]]; then
         systemctl disable --now wg-panel-update-check.timer
@@ -333,11 +374,10 @@ edit_panel_port() (
   require_panel
   local panel_port old_port backup wg_port wg_end
   old_port=$(setting PANEL_PORT)
-  ask panel_port "Panel TCP port [$old_port]: "
+  if [[ -n ${1:-} ]]; then panel_port=$1; else ask panel_port "Panel TCP port [$old_port]: "; fi
   panel_port=${panel_port:-$old_port}
   valid_port "$panel_port" || fail 'Port must be 1-65535.'
-  [[ $panel_port != "$old_port" ]] || { printf 'Port unchanged.\n'; return; }
-  if ss -H -ltn "sport = :$panel_port" | grep -q .; then fail 'Panel TCP port is already in use.'; fi
+  if [[ $panel_port != "$old_port" ]] && ss -H -ltn "sport = :$panel_port" | grep -q .; then fail 'Panel TCP port is already in use.'; fi
   if [[ -f $config_dir/ssl/compose.yml ]]; then
     [[ $panel_port != 80 && $panel_port != 443 ]] || fail 'Ports 80 and 443 are reserved for HTTPS.'
   fi
@@ -345,19 +385,37 @@ edit_panel_port() (
   flock -n 9 || fail 'An update or edit is already running.'
   backup=$(mktemp "$config_dir/panel.env.backup.XXXXXXXX")
   cp -p "$config_dir/panel.env" "$backup"
+  wg_port=$(setting WG_PORT)
+  wg_end=$(setting WG_PORT_END || setting WG_PORT)
+  configure_firewall
   sed -i "s/^PANEL_PORT=.*/PANEL_PORT='$panel_port'/" "$config_dir/panel.env"
   if ! "$config_dir/compose" config --quiet || ! "$config_dir/compose" up -d --force-recreate --wait --wait-timeout 180; then
     cp -p "$backup" "$config_dir/panel.env"
     "$config_dir/compose" up -d --force-recreate --wait --wait-timeout 180 || true
     fail "Port change failed; previous settings restored. Backup: $backup"
   fi
-  wg_port=$(setting WG_PORT)
-  wg_end=$(setting WG_PORT_END || setting WG_PORT)
-  configure_firewall
   printf 'Panel port changed to %s. Settings backup: %s\n' "$panel_port" "$backup"
   if [[ -f $config_dir/ssl/compose.yml ]]; then
-    printf 'Select Edit > HTTPS certificate to update the reverse proxy destination.\n'
+    cp -p "$config_dir/ssl/Caddyfile" "$config_dir/ssl/Caddyfile.backup"
+    sed -i "s/127[.]0[.]0[.]1:$old_port\\b/127.0.0.1:$panel_port/g" "$config_dir/ssl/Caddyfile"
+    if ! ssl_compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile || ! ssl_compose up -d --force-recreate; then
+      cp -p "$config_dir/ssl/Caddyfile.backup" "$config_dir/ssl/Caddyfile"
+      cp -p "$backup" "$config_dir/panel.env"
+      "$config_dir/compose" up -d --force-recreate --wait --wait-timeout 180 || true
+      ssl_compose up -d --force-recreate || true
+      fail 'Reverse proxy reload failed; previous settings restored.'
+    fi
   fi
+)
+
+apply_panel_settings() (
+  config_dir=/etc/wg-panel
+  local requested_port
+  mv "$config_dir/update-control/apply-request" "$config_dir/update-control/apply-running"
+  trap 'rm -f -- "$config_dir/update-control/apply-running"' EXIT
+  IFS= read -r requested_port <"$config_dir/update-control/apply-running"
+  valid_port "$requested_port" || fail 'Invalid requested panel port.'
+  edit_panel_port "$requested_port"
 )
 
 edit_panel() {
@@ -388,6 +446,32 @@ setup_updater() {
     grep -q '^    volumes:$' "$config_dir/runtime.compose.yml" || fail 'Unsupported runtime Compose file.'
     sed -i '/^    volumes:$/a\      - /etc/wg-panel/update-control:/run/wg-panel-update' "$config_dir/runtime.compose.yml"
   fi
+  if [[ -f $config_dir/runtime.compose.yml ]] && ! grep -q 'PANEL_PORT_OVERRIDE:' "$config_dir/runtime.compose.yml"; then
+    sed -i '/^      PANEL_PUBLISHED_PORT:/a\      PANEL_PORT_OVERRIDE: ${PANEL_PORT:-51821}' "$config_dir/runtime.compose.yml"
+  fi
+  cat >/etc/systemd/system/wg-panel-apply.service <<'APPLYSERVICE'
+[Unit]
+Description=Apply WireGuard panel settings
+After=docker.service
+Requires=docker.service
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 2
+ExecStart=/bin/bash /etc/wg-panel/updater.sh --apply-settings
+TimeoutStartSec=240
+UMask=0077
+StandardOutput=append:/etc/wg-panel/apply.log
+StandardError=append:/etc/wg-panel/apply.log
+APPLYSERVICE
+  cat >/etc/systemd/system/wg-panel-apply.path <<'APPLYPATH'
+[Unit]
+Description=Watch for WireGuard panel settings
+[Path]
+PathExists=/etc/wg-panel/update-control/apply-request
+Unit=wg-panel-apply.service
+[Install]
+WantedBy=multi-user.target
+APPLYPATH
   cat >/etc/systemd/system/wg-panel-update.service <<'SERVICE'
 [Unit]
 Description=Update private WireGuard panel
@@ -430,7 +514,8 @@ OnUnitActiveSec=5min
 WantedBy=timers.target
 CHECKTIMER
   systemctl daemon-reload
-  systemctl enable --now wg-panel-update.path wg-panel-update-check.timer
+  systemctl enable --now wg-panel-update.path wg-panel-update-check.timer wg-panel-apply.path
+  printf 'enabled\n' >"$config_dir/update-control/apply-enabled"
   systemctl start --no-block wg-panel-update-check.service
   printf 'enabled\n' >"$config_dir/update-control/enabled"
 }
@@ -439,7 +524,7 @@ check_panel_update() (
   config_dir=/etc/wg-panel
   export GIT_SSH_COMMAND="ssh -F /dev/null -i $config_dir/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$config_dir/known_hosts -o HostKeyAlgorithms=ssh-ed25519"
   local remote revision latest_file
-  remote=$(git ls-remote git@github.com:pashaDeveloper/wg-pasha-master.git HEAD) || {
+  remote=$(git ls-remote "git@github.com:$PANEL_REPOSITORY.git" HEAD) || {
     rm -f "$config_dir/update-control/latest.json"
     return 1
   }
@@ -457,6 +542,89 @@ update_status() {
   printf '{"state":"%s","revision":"%s","updatedAt":"%s"}\n' "$1" "${revision:-unknown}" "$(date -u +%FT%TZ)" >"$status_file"
   mv -f "$status_file" "$config_dir/update-control/status.json"
 }
+
+check_wireguard_update_routes() {
+  # Inspect the running version before stopping it. Never silently replace a
+  # WireGuard user's proxy egress with direct routing when removing that core.
+  local -a route_command=("$config_dir/compose" exec -T wg-easy node)
+  if [[ -n ${1:-} ]]; then
+    route_command=(docker run --rm -i --entrypoint node --mount "type=volume,src=$2,dst=/etc/wireguard,readonly" "$1")
+  fi
+  "${route_command[@]}" --input-type=module <<'ROUTECHECK'
+import { readFile } from 'node:fs/promises';
+let settings;
+try {
+  settings = JSON.parse(await readFile('/etc/wireguard/outbound-routing.json', 'utf8'));
+} catch (error) {
+  if (error.code === 'ENOENT') process.exit(0);
+  throw error;
+}
+if (!Array.isArray(settings.rules) || !Array.isArray(settings.outbounds) || typeof settings.enabled !== 'boolean') {
+  throw new Error('Cannot verify saved routing settings. Existing panel was not stopped.');
+}
+if (settings.enabled && settings.rules.some(rule => {
+  if (!/^wg\d{1,5}$/.test(rule.inbound) || rule.outbound === null) return false;
+  const outbound = settings.outbounds.find(entry => entry.id === rule.outbound);
+  return !outbound || !['wireguard', 'openvpn'].includes(outbound.protocol);
+})) {
+  throw new Error('Update blocked: WireGuard users depend on a proxy core removed in this version. In the current panel, migrate these routes to WireGuard/OpenVPN or explicitly select direct routing, then retry. Existing panel was not stopped.');
+}
+ROUTECHECK
+}
+
+# Recover a failed first installation (or a removed container) using the newly
+# cloned checkout. The caller holds update.lock. Existing volumes are backed up.
+resume_panel_install() (
+  local source_dir=$1 revision=$2 old_image='' new_image volume backup_dir='' snapshot=0 switched=0
+  finish_reinstall() {
+    local result=$?
+    trap - EXIT
+    if (( result != 0 )); then
+      if (( switched )); then
+        "$config_dir/compose" stop || true
+        if (( snapshot )); then
+          docker run --rm --entrypoint sh --mount "type=volume,src=$volume,dst=/data" --mount "type=bind,src=$backup_dir,dst=/backup,readonly" "$new_image" -c 'test -d /backup/wireguard && find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && cp -a /backup/wireguard/. /data/' || printf 'Restore failed. Keep the panel stopped; backup: %s\n' "$backup_dir"
+        fi
+        cp -p "$backup_dir/runtime.compose.yml" "$config_dir/runtime.compose.yml"
+      fi
+      if [[ -n $old_image ]]; then docker tag "$old_image" pasha-forever-wireguard:local || true; fi
+      if [[ -n $backup_dir ]]; then
+        printf 'Reinstallation failed. Settings and any existing data backup: %s\n' "$backup_dir"
+      else
+        printf 'Reinstallation failed before starting the panel; saved settings and data were kept.\n'
+      fi
+    fi
+    exit "$result"
+  }
+  trap finish_reinstall EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  old_image=$(docker image inspect --format '{{.Id}}' pasha-forever-wireguard:local 2>/dev/null) || old_image=''
+  if [[ -n $old_image ]]; then docker tag "$old_image" pasha-forever-wireguard:rollback; fi
+  docker build --build-arg "PANEL_REVISION=$revision" -t pasha-forever-wireguard:local "$source_dir"
+  new_image=$(docker image inspect --format '{{.Id}}' pasha-forever-wireguard:local)
+  # Compose resolves the existing volume name, including explicit custom names.
+  volume=$("$config_dir/compose" config --format json | docker run --rm -i --entrypoint node "$new_image" -e 'let input="";for await(const chunk of process.stdin)input+=chunk;const config=JSON.parse(input);const mount=config.services["wg-easy"].volumes.find(entry=>entry.target==="/etc/wireguard"&&entry.type==="volume");if(!mount)process.exit(1);const name=config.volumes[mount.source]?.name;if(!name)process.exit(1);process.stdout.write(name);')
+  [[ $volume =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail 'Reinstallation requires the named WireGuard data volume.'
+  backup_dir=$(mktemp -d "$config_dir/backups/reinstall-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXX")
+  cp -p "$config_dir/runtime.compose.yml" "$config_dir/panel.env" "$backup_dir/"
+  if docker volume inspect "$volume" >/dev/null 2>&1; then
+    check_wireguard_update_routes "$new_image" "$volume" || fail 'Saved WireGuard routes require the previous proxy runtime.'
+    docker run --rm --entrypoint sh --mount "type=volume,src=$volume,dst=/data,readonly" --mount "type=bind,src=$backup_dir,dst=/backup" "$new_image" -c 'mkdir -p /backup/wireguard && cp -a /data/. /backup/wireguard/'
+    snapshot=1
+  fi
+  switched=1
+  sed -i '/XRAY_PORT_START.*XRAY_PORT_END/d' "$config_dir/runtime.compose.yml"
+  setup_updater
+  local panel_port wg_port wg_end
+  panel_port=$(setting PANEL_PORT)
+  wg_port=$(setting WG_PORT)
+  wg_end=$(setting WG_PORT_END || setting WG_PORT)
+  configure_firewall
+  "$config_dir/compose" up -d --force-recreate --wait --wait-timeout 180
+  "$config_dir/compose" exec -T wg-easy node --input-type=module -e 'import {applyPanelSettings,readPanelSettings} from "/app/launcher.mjs";applyPanelSettings(readPanelSettings("/etc/wireguard/wg-easy.db"),process.env);const http=await import(process.env.PANEL_TLS_ACTIVE === "true"?"node:https":"node:http");const r=http.get({hostname:"127.0.0.1",port:process.env.PORT,path:process.env.NUXT_APP_BASE_URL,rejectUnauthorized:false},res=>process.exit([200,301,302,303,307,308].includes(res.statusCode)?0:1));r.setTimeout(10000,()=>{r.destroy();process.exit(1)});r.on("error",()=>process.exit(1));'
+  printf 'Latest panel installed from %s. Settings backup: %s\n' "$revision" "$backup_dir"
+)
 
 update_panel() (
   [[ ${EUID} == 0 ]] || fail 'Run with sudo bash install.sh.'
@@ -501,22 +669,28 @@ update_panel() (
   [[ -f $config_dir/deploy_key && -f $config_dir/known_hosts ]] || fail 'The saved GitHub Deploy Key or known_hosts file is missing.'
   export GIT_SSH_COMMAND="ssh -F /dev/null -i $config_dir/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$config_dir/known_hosts -o HostKeyAlgorithms=ssh-ed25519"
   source_dir=$(mktemp -d /opt/wg-panel-update.XXXXXXXX)
-  git clone --depth 1 git@github.com:pashaDeveloper/wg-pasha-master.git "$source_dir"
+  git clone --depth 1 "git@github.com:$PANEL_REPOSITORY.git" "$source_dir"
   revision=$(git -C "$source_dir" rev-parse HEAD)
   [[ $revision =~ ^[a-f0-9]{40,64}$ ]] || fail 'Invalid source revision.'
-  # The public installer is published separately and is not part of the private source.
+  printf 'Downloaded source revision: %s\n' "$revision"
+  # The installer and panel source are maintained in the same repository.
   local required_file
   for required_file in Dockerfile src/package.json src/launcher.mjs; do
     [[ -f $source_dir/$required_file ]] || fail "Private repository revision $revision is missing $required_file. Push the panel source to the default branch."
   done
   local container current
   container=$("$config_dir/compose" ps -q wg-easy)
+  if [[ -z $container && ${1:-} == --reinstall ]]; then
+    resume_panel_install "$source_dir" "$revision"
+    update_status succeeded
+    return
+  fi
   [[ -n $container ]] || fail 'Start the existing panel before updating.'
   old_image=$(docker inspect --format '{{.Image}}' "$container")
   volume=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/etc/wireguard"}}{{.Name}}{{end}}{{end}}' "$container")
   [[ $volume =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail 'Updates require the named WireGuard data volume.'
   current=$("$config_dir/compose" exec -T wg-easy node -e 'process.stdout.write(process.env.PANEL_REVISION || "unknown")')
-  if [[ $current == "$revision" ]]; then
+  if [[ $current == "$revision" && ${1:-} != --reinstall ]]; then
     setup_updater
     "$config_dir/compose" up -d --wait --wait-timeout 180
     update_status unchanged
@@ -524,6 +698,7 @@ update_panel() (
     return
   fi
   # Build before stopping the running panel. Preserve its image for rollback.
+  check_wireguard_update_routes || fail 'Routing compatibility check failed; the existing panel is still running.'
   docker tag "$old_image" pasha-forever-wireguard:rollback
   docker build --build-arg "PANEL_REVISION=$revision" -t pasha-forever-wireguard:local "$source_dir"
   backup_dir=$(mktemp -d "$config_dir/backups/update-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXX")
@@ -532,12 +707,15 @@ update_panel() (
   "$config_dir/compose" stop
   # Offline snapshot includes the database, WAL, keys and interface configuration.
   docker run --rm --entrypoint sh --mount "type=volume,src=$volume,dst=/data,readonly" --mount "type=bind,src=$backup_dir,dst=/backup" "$old_image" -c 'mkdir -p /backup/wireguard && cp -a /data/. /backup/wireguard/'
-  setup_updater
   switched=1
+  # Remove only the retired core's generated port mappings. WireGuard ports,
+  # volumes and network settings stay in the existing runtime Compose file.
+  sed -i '/XRAY_PORT_START.*XRAY_PORT_END/d' "$config_dir/runtime.compose.yml"
+  setup_updater
   "$config_dir/compose" up -d --force-recreate --wait --wait-timeout 180
   "$config_dir/compose" exec -T wg-easy node --input-type=module -e 'import {applyPanelSettings,readPanelSettings} from "/app/launcher.mjs";applyPanelSettings(readPanelSettings("/etc/wireguard/wg-easy.db"),process.env);const http=await import(process.env.PANEL_TLS_ACTIVE === "true"?"node:https":"node:http");const r=http.get({hostname:"127.0.0.1",port:process.env.PORT,path:process.env.NUXT_APP_BASE_URL,rejectUnauthorized:false},res=>process.exit([200,301,302,303,307,308].includes(res.statusCode)?0:1));r.setTimeout(10000,()=>{r.destroy();process.exit(1)});r.on("error",()=>process.exit(1));'
-  # Older private repositories may bundle the installer; otherwise keep the host copy.
-  # Refresh it only after the new panel has passed its checks.
+  # Refresh the host installer from the same checked-out panel revision only
+  # after the new panel has passed its checks. Keep compatibility with old tags.
   if [[ -f $source_dir/public-installer/install.sh ]]; then
     bash -n "$source_dir/public-installer/install.sh"
     install -m 0700 "$source_dir/public-installer/install.sh" "$config_dir/updater.sh.new"
@@ -1345,6 +1523,63 @@ udp2raw_menu() {
 
 # END UDP2RAW HOST SUPPORT
 
+password_recovery_program() {
+  cat <<'RECOVERYJS'
+const { createRequire } = require('node:module');
+const { existsSync } = require('node:fs');
+const appRequire = createRequire('/app/server/cli.mjs');
+const argon2 = appRequire('argon2');
+const { createClient } = appRequire('@libsql/client');
+(async () => {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  const input = Buffer.concat(chunks).toString('utf8');
+  const split = input.indexOf('\0');
+  if (split < 0) throw new Error('Invalid recovery input');
+  const username = input.slice(0, split);
+  const password = input.slice(split + 1);
+  if (typeof username !== 'string' || typeof password !== 'string' || password.length < 12 || password.length > 256) {
+    throw new Error('Invalid recovery input');
+  }
+  const path = '/etc/wireguard/wg-easy.db';
+  if (!existsSync(path)) throw new Error('Panel database not found');
+  const client = createClient({ url: `file:${path}` });
+  let tx;
+  try {
+    const hash = await argon2.hash(password);
+    tx = await client.transaction('write');
+    const result = await tx.execute({
+      sql: username ? 'SELECT id, role FROM users_table WHERE username = ?' : 'SELECT id, role FROM users_table WHERE id = 1',
+      args: username ? [username] : [],
+    });
+    const user = result.rows[0];
+    if (!user || ![1, 3].includes(Number(user.role))) throw new Error('Administrator not found');
+    const updated = await tx.execute({
+      sql: 'UPDATE users_table SET password = ?, totp_verified = 0, totp_key = NULL WHERE id = ?',
+      args: [hash, user.id],
+    });
+    if (updated.rowsAffected !== 1) throw new Error('Administrator was not updated');
+    const saved = await tx.execute({ sql: 'SELECT password, totp_verified, totp_key FROM users_table WHERE id = ?', args: [user.id] });
+    const row = saved.rows[0];
+    if (!row || !(await argon2.verify(row.password, password)) || Number(row.totp_verified) !== 0 || row.totp_key !== null) {
+      throw new Error('Password verification failed');
+    }
+    await tx.commit();
+    console.log('PASSWORD_RECOVERY_VERIFIED');
+  } catch (error) {
+    if (tx) await tx.rollback().catch(() => {});
+    throw error;
+  } finally {
+    tx?.close();
+    client.close();
+  }
+})().catch(() => {
+  console.error('Password recovery failed. Check the administrator username and container database/dependencies.');
+  process.exitCode = 1;
+});
+RECOVERYJS
+}
+
 reset_panel_password() {
   [[ -x $config_dir/compose ]] || fail 'Install the panel first.'
   local username password confirmation
@@ -1353,10 +1588,16 @@ reset_panel_password() {
   secret confirmation 'Repeat new password: '
   [[ $password == "$confirmation" ]] || fail 'Passwords do not match.'
   (( ${#password} >= 12 && ${#password} <= 256 )) || fail 'Use 12-256 characters.'
-  local args=(db:admin:reset --password-stdin)
-  [[ -z $username ]] || args+=(--username "$username")
-  printf '%s' "$password" | "$config_dir/compose" exec -T wg-easy /usr/local/bin/cli "${args[@]}"
+  local result
+  # A NUL separator preserves special characters; secrets enter only over stdin.
+  # Use the existing image's dependencies, independent of its CLI argument support.
+  if ! result=$(printf '%s\0%s' "$username" "$password" |
+    "$config_dir/compose" exec -T wg-easy node -e "$(password_recovery_program)"); then
+    unset password confirmation
+    fail 'Password recovery failed; no success was confirmed.'
+  fi
   unset password confirmation
+  [[ $result == PASSWORD_RECOVERY_VERIFIED ]] || fail 'Password recovery was not verified.'
   printf 'Password recovery completed. TOTP was reset for this account.\n'
 }
 
@@ -1389,7 +1630,7 @@ main() {
   install_dir=/opt/wg-panel
   local choice
   while true; do
-    printf '\n1. Install panel\n2. Edit panel\n3. Remove panel\n4. Update panel / recover password\n5. WireGuard UDP tunnels\n6. Recover/change administrator password\nq) Exit\n'
+    printf '\n1. Install panel\n2. Edit panel\n3. Remove panel\n4. Update panel / recover password\n5. WireGuard UDP tunnels\n6. Recover/change administrator password\n7. Start/restart panel\nq) Exit\n'
     ask choice 'Select an option: '
     case "$choice" in
       1) run_action install_panel ;;
@@ -1398,6 +1639,7 @@ main() {
       4) run_action update_menu ;;
       5) run_action tunnel_menu ;;
       6) run_action reset_panel_password ;;
+      7) run_action restart_panel ;;
       q|Q) return ;;
       *) printf 'Invalid option.\n' ;;
     esac
@@ -1408,6 +1650,8 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   if [[ ${1:-} == --update-worker ]]; then
     [[ -e /etc/wg-panel/update-control/request ]] || exit 0
     update_panel
+  elif [[ ${1:-} == --apply-settings ]]; then
+    apply_panel_settings
   elif [[ ${1:-} == --check-update ]]; then
     check_panel_update
   else
