@@ -231,10 +231,21 @@ restart_panel() (
   exec 9>"$config_dir/update.lock"
   flock -n 9 || fail 'An update or edit is already running.'
   printf 'Restarting the panel. VPN connections may briefly disconnect.\n'
+  # Remove only this service's container, never its named data volume.
+  # Explicit teardown releases its published ports before creating a new one.
+  "$config_dir/compose" stop --timeout 30 wg-easy
+  "$config_dir/compose" rm --force wg-easy
   if ! "$config_dir/compose" up -d --no-build --pull never --force-recreate --wait --wait-timeout 180 wg-easy; then
     "$config_dir/compose" ps --all || true
     "$config_dir/compose" logs --tail 50 wg-easy || true
-    fail 'Panel restart failed. Review the error and logs above.'
+    printf 'UDP sockets in the configured WireGuard range:\n'
+    local first last
+    first=$(setting WG_PORT)
+    last=$(setting WG_PORT_END || setting WG_PORT)
+    if valid_port "$first" && valid_port "$last"; then
+      ss -H -uanp "sport >= :$first and sport <= :$last" || true
+    fi
+    fail 'Panel restart failed. Its old container was removed. Ports owned by other services were not changed; review the error and socket owners above.'
   fi
   if [[ -f $config_dir/ssl/compose.yml ]]; then
     ssl_compose up -d --pull never --force-recreate
