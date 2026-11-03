@@ -351,6 +351,40 @@ func withTunnelOption(content, flag, value string) (string, error) {
 	return content[:command[2]] + line + content[command[3]:], nil
 }
 
+func editTunnelPassword(units []portUnit) ([]portUnit, error) {
+	result := append([]portUnit(nil), units...)
+	var err error
+	var password string
+	if err := survey.AskOne(&survey.Password{Message: "Enter Password (Enter = keep current):"}, &password, survey.WithValidator(func(v interface{}) error {
+		p := fmt.Sprint(v)
+		if p != "" && !regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`).MatchString(p) {
+			return fmt.Errorf("use 1-128 letters, digits, underscores or hyphens; Enter keeps the current password")
+		}
+		return nil
+	})); err != nil {
+		return nil, err
+	}
+	if password != "" {
+		var repeated string
+		if err := survey.AskOne(&survey.Password{Message: "Repeat new shared password:"}, &repeated); err != nil {
+			return nil, err
+		}
+		if password != repeated {
+			return nil, fmt.Errorf("passwords do not match; nothing saved")
+		}
+		for i := range result {
+			result[i].content, err = withTunnelOption(result[i].content, "-k", password)
+			if err != nil {
+				return nil, err
+			}
+		}
+		fmt.Println("Shared password: changed (hidden); applied to UDP2RAW and its local FEC service.")
+	} else {
+		fmt.Println("Shared password: unchanged (hidden).")
+	}
+	return result, nil
+}
+
 func editTunnelDetails(units []portUnit, iran bool) ([]portUnit, error) {
 	result := append([]portUnit(nil), units...)
 	if iran {
@@ -382,41 +416,23 @@ func editTunnelDetails(units []portUnit, iran bool) ([]portUnit, error) {
 	if len(currentMode) != 2 {
 		return nil, fmt.Errorf("cannot read current raw mode")
 	}
-	if err := survey.AskOne(&survey.Select{Message: "Raw mode (must match on both servers):", Options: []string{"faketcp", "udp", "icmp"}, Default: currentMode[1]}, &mode); err != nil {
-		return nil, err
-	}
-	var err error
-	result[0].content, err = withTunnelOption(result[0].content, "--raw-mode", mode)
-	if err != nil {
-		return nil, err
-	}
-	var password string
-	if err := survey.AskOne(&survey.Password{Message: "New shared password (Enter = keep current; letters/digits/_/-):"}, &password, survey.WithValidator(func(v interface{}) error {
-		p := fmt.Sprint(v)
-		if p != "" && !regexp.MustCompile(`^[A-Za-z0-9_-]{12,128}$`).MatchString(p) {
-			return fmt.Errorf("use 12-128 letters, digits, underscores or hyphens")
+	fmt.Println("\033[92mSelect raw mode:\033[0m")
+	fmt.Println("1. \033[92mFakeTCP\033[0m\n2. \033[96mUDP\033[0m\n3. \033[91mICMP\033[0m")
+	choices := map[string]string{"1": "faketcp", "2": "udp", "3": "icmp"}
+	defaults := map[string]string{"faketcp": "1", "udp": "2", "icmp": "3"}
+	if err := survey.AskOne(&survey.Input{Message: "Enter your choice:", Default: defaults[currentMode[1]]}, &mode, survey.WithValidator(func(v interface{}) error {
+		if _, ok := choices[fmt.Sprint(v)]; !ok {
+			return fmt.Errorf("choose 1, 2 or 3")
 		}
 		return nil
 	})); err != nil {
 		return nil, err
 	}
-	if password != "" {
-		var repeated string
-		if err := survey.AskOne(&survey.Password{Message: "Repeat new shared password:"}, &repeated); err != nil {
-			return nil, err
-		}
-		if password != repeated {
-			return nil, fmt.Errorf("passwords do not match; nothing saved")
-		}
-		for i := range result {
-			result[i].content, err = withTunnelOption(result[i].content, "-k", password)
-			if err != nil {
-				return nil, err
-			}
-		}
-		fmt.Println("Shared password: changed (hidden); applied to UDP2RAW and its local FEC service.")
-	} else {
-		fmt.Println("Shared password: unchanged (hidden).")
+	mode = choices[mode]
+	var err error
+	result[0].content, err = withTunnelOption(result[0].content, "--raw-mode", mode)
+	if err != nil {
+		return nil, err
 	}
 	fmt.Println("Raw mode:", mode)
 	return result, nil
@@ -453,6 +469,10 @@ func managePortPair(directory string, adding bool) error {
 	if err != nil {
 		return err
 	}
+	fmt.Println("\033[93m────────────────────────────────────────\033[0m")
+	fmt.Printf("\033[92m    Config: %s\033[0m\n", selected)
+	fmt.Println("\033[93m────────────────────────────────────────\033[0m")
+	fmt.Println("Enter keeps each current value. Password stays hidden.")
 	_, listen, _ := unitEndpoint(before[0].content, "l")
 	_, remote, _ := unitEndpoint(before[0].content, "r")
 	tunnel, wireguard, fec := listen, remote, 0
@@ -483,6 +503,13 @@ func managePortPair(directory string, adding bool) error {
 	if err := promptPort("Tunnel port (use the same value on Iran and Outside):", &tunnel); err != nil {
 		return err
 	}
+	working := before
+	if !adding {
+		working, err = editTunnelPassword(before)
+		if err != nil {
+			return err
+		}
+	}
 	label := "WireGuard destination UDP port on this server:"
 	if iran {
 		label = "Local UDP2RAW entry/link port:"
@@ -499,7 +526,7 @@ func managePortPair(directory string, adding bool) error {
 			return err
 		}
 	}
-	after, err := remapPortPair(before, tunnel, wireguard, fec)
+	after, err := remapPortPair(working, tunnel, wireguard, fec)
 	if err != nil {
 		return err
 	}
