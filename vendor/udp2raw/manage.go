@@ -488,36 +488,44 @@ func managePortPair(directory string, adding bool) error {
 		return fmt.Errorf("no existing UDP2RAW configuration; run initial setup first")
 	}
 	sort.Strings(options)
-	options = append(options, "Back")
-	message := "Select tunnel to edit (ports, password, raw mode and remote address):"
-	if adding {
-		message = "Select existing configuration as template for an additional port:"
-	}
-	fmt.Printf("\033[92m%s\033[0m\n", message)
-	for i, option := range options {
-		fmt.Printf("%d. %s\n", i+1, option)
-	}
-	selection, err := tunnelPrompt("Enter your choice", "", false, func(v string) error {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > len(options) {
-			return fmt.Errorf("choose 1-%d", len(options))
+	selected := options[0]
+	if !adding {
+		options = append(options, "Back")
+		fmt.Println("\033[92mSelect tunnel to edit:\033[0m")
+		for i, option := range options {
+			fmt.Printf("%d. %s\n", i+1, option)
 		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	n, _ := strconv.Atoi(selection)
-	selected := options[n-1]
-	if selected == "Back" {
-		return nil
+		selection, err := tunnelPrompt("Enter your choice", "", false, func(v string) error {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > len(options) {
+				return fmt.Errorf("choose 1-%d", len(options))
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		n, _ := strconv.Atoi(selection)
+		selected = options[n-1]
+		if selected == "Back" {
+			return nil
+		}
 	}
 	before, err := portPair(directory, selected)
 	if err != nil {
 		return err
 	}
 	fmt.Println("\033[93m────────────────────────────────────────\033[0m")
-	fmt.Printf("\033[92m    Config: %s\033[0m\n", selected)
+	if adding {
+		next, err := nextPortPair(directory, before)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("\033[92m    New tunnel: %s\033[0m\n", next[0].name)
+		fmt.Println("A separate service will be created using this server's existing tunnel type. Existing services stay unchanged.")
+	} else {
+		fmt.Printf("\033[92m    Config: %s\033[0m\n", selected)
+	}
 	fmt.Println("\033[93m────────────────────────────────────────\033[0m")
 	fmt.Println("Enter keeps each current value. Password stays hidden.")
 	_, listen, _ := unitEndpoint(before[0].content, "l")
