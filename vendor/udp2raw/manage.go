@@ -335,6 +335,93 @@ func managePortMenu(adding bool) {
 	}
 }
 
+// Restrict replacements to ExecStart; never render stored credentials in prompts.
+func withTunnelOption(content, flag, value string) (string, error) {
+	command := managedExec.FindStringSubmatchIndex(content)
+	if len(command) == 0 {
+		return "", fmt.Errorf("missing ExecStart")
+	}
+	line := content[command[2]:command[3]]
+	pattern := regexp.MustCompile(`(?:^|\s)` + regexp.QuoteMeta(flag) + `\s+("[^"\r\n]*"|'[^'\r\n]*'|[^\s]+)`)
+	match := pattern.FindStringSubmatchIndex(line)
+	if len(match) == 0 {
+		return "", fmt.Errorf("missing %s option; existing configuration kept", flag)
+	}
+	line = line[:match[2]] + value + line[match[3]:]
+	return content[:command[2]] + line + content[command[3]:], nil
+}
+
+func editTunnelDetails(units []portUnit, iran bool) ([]portUnit, error) {
+	result := append([]portUnit(nil), units...)
+	if iran {
+		host, number, err := unitEndpoint(result[0].content, "r")
+		if err != nil {
+			return nil, err
+		}
+		var value string
+		if err := survey.AskOne(&survey.Input{Message: "Outside server IP or hostname:", Default: host}, &value, survey.WithValidator(func(v interface{}) error {
+			h := fmt.Sprint(v)
+			if net.ParseIP(h) != nil {
+				return nil
+			}
+			if len(h) > 253 || !regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$`).MatchString(h) || strings.Contains(h, "..") {
+				return fmt.Errorf("enter an IP address or hostname")
+			}
+			return nil
+		})); err != nil {
+			return nil, err
+		}
+		command := managedExec.FindStringSubmatchIndex(result[0].content)
+		line := result[0].content[command[2]:command[3]]
+		endpoint := regexp.MustCompile(`(?:^|\s)-r\s*(\S+)`).FindStringSubmatchIndex(line)
+		line = line[:endpoint[2]] + net.JoinHostPort(value, strconv.Itoa(number)) + line[endpoint[3]:]
+		result[0].content = result[0].content[:command[2]] + line + result[0].content[command[3]:]
+	}
+	var mode string
+	currentMode := regexp.MustCompile(`--raw-mode\s+(faketcp|udp|icmp)\b`).FindStringSubmatch(result[0].content)
+	if len(currentMode) != 2 {
+		return nil, fmt.Errorf("cannot read current raw mode")
+	}
+	if err := survey.AskOne(&survey.Select{Message: "Raw mode (must match on both servers):", Options: []string{"faketcp", "udp", "icmp"}, Default: currentMode[1]}, &mode); err != nil {
+		return nil, err
+	}
+	var err error
+	result[0].content, err = withTunnelOption(result[0].content, "--raw-mode", mode)
+	if err != nil {
+		return nil, err
+	}
+	var password string
+	if err := survey.AskOne(&survey.Password{Message: "New shared password (Enter = keep current; letters/digits/_/-):"}, &password, survey.WithValidator(func(v interface{}) error {
+		p := fmt.Sprint(v)
+		if p != "" && !regexp.MustCompile(`^[A-Za-z0-9_-]{12,128}$`).MatchString(p) {
+			return fmt.Errorf("use 12-128 letters, digits, underscores or hyphens")
+		}
+		return nil
+	})); err != nil {
+		return nil, err
+	}
+	if password != "" {
+		var repeated string
+		if err := survey.AskOne(&survey.Password{Message: "Repeat new shared password:"}, &repeated); err != nil {
+			return nil, err
+		}
+		if password != repeated {
+			return nil, fmt.Errorf("passwords do not match; nothing saved")
+		}
+		for i := range result {
+			result[i].content, err = withTunnelOption(result[i].content, "-k", password)
+			if err != nil {
+				return nil, err
+			}
+		}
+		fmt.Println("Shared password: changed (hidden); applied to UDP2RAW and its local FEC service.")
+	} else {
+		fmt.Println("Shared password: unchanged (hidden).")
+	}
+	fmt.Println("Raw mode:", mode)
+	return result, nil
+}
+
 func managePortPair(directory string, adding bool) error {
 	entries, err := os.ReadDir(directory)
 	if err != nil {
@@ -352,7 +439,7 @@ func managePortPair(directory string, adding bool) error {
 	sort.Strings(options)
 	options = append(options, "Back")
 	var selected string
-	message := "Select configuration to edit ports:"
+	message := "Select tunnel to edit (ports, password, raw mode and remote address):"
 	if adding {
 		message = "Select existing configuration as template for an additional port:"
 	}
@@ -416,6 +503,12 @@ func managePortPair(directory string, adding bool) error {
 	if err != nil {
 		return err
 	}
+	if !adding {
+		after, err = editTunnelDetails(after, iran)
+		if err != nil {
+			return err
+		}
+	}
 	if adding {
 		after, err = nextPortPair(directory, after)
 		if err != nil {
@@ -425,14 +518,15 @@ func managePortPair(directory string, adding bool) error {
 	if err := checkPortListeners(directory, before, after, adding); err != nil {
 		return err
 	}
-	fmt.Println("Credentials, remote address and raw mode are inherited. Configure matching ports on the other server too.")
+	fmt.Println("Review changes below. Match tunnel port, password and raw mode on the other server; changes here apply only to this server.")
 	for _, unit := range after {
 		_, l, _ := unitEndpoint(unit.content, "l")
 		_, r, _ := unitEndpoint(unit.content, "r")
-		fmt.Printf("%s: listen %d -> destination %d\n", unit.name, l, r)
+		host, _, _ := unitEndpoint(unit.content, "r")
+		fmt.Printf("%s: listen %d -> %s\n", unit.name, l, net.JoinHostPort(host, strconv.Itoa(r)))
 	}
 	var confirm bool
-	if err := survey.AskOne(&survey.Confirm{Message: "Apply these ports?", Default: false}, &confirm); err != nil {
+	if err := survey.AskOne(&survey.Confirm{Message: "Save changes and restart this tunnel? (automatic rollback on failure)", Default: false}, &confirm); err != nil {
 		return err
 	}
 	if !confirm {

@@ -208,7 +208,7 @@ func mainMenu() {
 		fmt.Println(border)
 		prompt := &survey.Select{
 			Message: "Enter your choice Please:",
-			Options: []string{"0. \033[91mSTATUS Menu\033[0m", "1. \033[96mUDP2RAW \033[0m", "2. \033[93mUDP2RAW FEC \033[92mIPV4\033[0m", "3. \033[96mUDP2RAW FEC \033[92mIPV6\033[0m", "4. \033[93mUDP2RAW FEC \033[92mICMP\033[0m", "5. \033[96mUDP2RAW FEC \033[92mIP6IP6\033[0m", "6. \033[92mStop | Restart Service\033[0m", "7. \033[91mUninstall\033[0m", "8. Add port from existing configuration", "9. Edit existing ports", "q. Exit"},
+			Options: []string{"0. \033[91mSTATUS Menu\033[0m", "1. \033[96mUDP2RAW \033[0m", "2. \033[93mUDP2RAW FEC \033[92mIPV4\033[0m", "3. \033[96mUDP2RAW FEC \033[92mIPV6\033[0m", "4. \033[93mUDP2RAW FEC \033[92mICMP\033[0m", "5. \033[96mUDP2RAW FEC \033[92mIP6IP6\033[0m", "6. \033[92mStop | Restart Service\033[0m", "7. \033[91mUninstall\033[0m", "8. Add port from existing configuration", "9. Edit tunnel settings", "q. Exit"},
 		
 		}
 		fmt.Println("\033[93m╰─────────────────────────────────────────────────────────────────────╯\033[0m")
@@ -237,7 +237,7 @@ func mainMenu() {
 			UniMenu()
 		case "8. Add port from existing configuration":
 			managePortMenu(true)
-		case "9. Edit existing ports":
+		case "9. Edit tunnel settings":
 			managePortMenu(false)
 		case "q. Exit":
 			fmt.Println("Exiting...")
