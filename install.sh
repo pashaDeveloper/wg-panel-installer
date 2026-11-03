@@ -555,7 +555,9 @@ try:
 }}
 {domain} {{
   header Referrer-Policy "no-referrer"
-  respond /__wg_subscription_health "wg-subscription-proxy" 200
+  handle /__wg_subscription_health {{
+    respond "wg-subscription-proxy" 200
+  }}
 {alias}  @subscription {{
     method GET HEAD
     path_regexp subscription ^(?:{page}|{api}|{asset})$
