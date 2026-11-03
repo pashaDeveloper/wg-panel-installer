@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"os"
@@ -11,8 +12,45 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/AlecAivazis/survey/v2"
+	"golang.org/x/term"
 )
+
+var tunnelInput = bufio.NewReader(os.Stdin)
+
+func tunnelPrompt(label, fallback string, hidden bool, validate func(string) error) (string, error) {
+	for {
+		fmt.Printf("\033[93m%s", label)
+		if fallback != "" {
+			fmt.Printf(" [%s]", fallback)
+		}
+		fmt.Print(": \033[0m")
+		var value string
+		if hidden && term.IsTerminal(int(os.Stdin.Fd())) {
+			data, err := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Println()
+			if err != nil {
+				return "", err
+			}
+			value = string(data)
+		} else {
+			line, err := tunnelInput.ReadString('\n')
+			if err != nil {
+				return "", err
+			}
+			value = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		}
+		if value == "" {
+			value = fallback
+		}
+		if validate != nil {
+			if err := validate(value); err != nil {
+				fmt.Printf("\033[91m%s\033[0m\n", err)
+				continue
+			}
+		}
+		return value, nil
+	}
+}
 
 var managedUnitName = regexp.MustCompile(`^azumi(udp|fec)_(kharej[1-9][0-9]*|iran-[1-9][0-9]*)\.service$`)
 var managedExec = regexp.MustCompile(`(?m)^ExecStart=([^\r\n]+)`)
@@ -354,19 +392,18 @@ func withTunnelOption(content, flag, value string) (string, error) {
 func editTunnelPassword(units []portUnit) ([]portUnit, error) {
 	result := append([]portUnit(nil), units...)
 	var err error
-	var password string
-	if err := survey.AskOne(&survey.Password{Message: "Enter Password (Enter = keep current):"}, &password, survey.WithValidator(func(v interface{}) error {
-		p := fmt.Sprint(v)
+	password, err := tunnelPrompt("Enter Password (Enter = keep current)", "", true, func(p string) error {
 		if p != "" && !regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`).MatchString(p) {
 			return fmt.Errorf("use 1-128 letters, digits, underscores or hyphens; Enter keeps the current password")
 		}
 		return nil
-	})); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
 	if password != "" {
-		var repeated string
-		if err := survey.AskOne(&survey.Password{Message: "Repeat new shared password:"}, &repeated); err != nil {
+		repeated, err := tunnelPrompt("Repeat Password", "", true, nil)
+		if err != nil {
 			return nil, err
 		}
 		if password != repeated {
@@ -392,9 +429,7 @@ func editTunnelDetails(units []portUnit, iran bool) ([]portUnit, error) {
 		if err != nil {
 			return nil, err
 		}
-		var value string
-		if err := survey.AskOne(&survey.Input{Message: "Outside server IP or hostname:", Default: host}, &value, survey.WithValidator(func(v interface{}) error {
-			h := fmt.Sprint(v)
+		value, err := tunnelPrompt("Enter Outside server IP or hostname", host, false, func(h string) error {
 			if net.ParseIP(h) != nil {
 				return nil
 			}
@@ -402,7 +437,8 @@ func editTunnelDetails(units []portUnit, iran bool) ([]portUnit, error) {
 				return fmt.Errorf("enter an IP address or hostname")
 			}
 			return nil
-		})); err != nil {
+		})
+		if err != nil {
 			return nil, err
 		}
 		command := managedExec.FindStringSubmatchIndex(result[0].content)
@@ -411,7 +447,6 @@ func editTunnelDetails(units []portUnit, iran bool) ([]portUnit, error) {
 		line = line[:endpoint[2]] + net.JoinHostPort(value, strconv.Itoa(number)) + line[endpoint[3]:]
 		result[0].content = result[0].content[:command[2]] + line + result[0].content[command[3]:]
 	}
-	var mode string
 	currentMode := regexp.MustCompile(`--raw-mode\s+(faketcp|udp|icmp)\b`).FindStringSubmatch(result[0].content)
 	if len(currentMode) != 2 {
 		return nil, fmt.Errorf("cannot read current raw mode")
@@ -420,16 +455,16 @@ func editTunnelDetails(units []portUnit, iran bool) ([]portUnit, error) {
 	fmt.Println("1. \033[92mFakeTCP\033[0m\n2. \033[96mUDP\033[0m\n3. \033[91mICMP\033[0m")
 	choices := map[string]string{"1": "faketcp", "2": "udp", "3": "icmp"}
 	defaults := map[string]string{"faketcp": "1", "udp": "2", "icmp": "3"}
-	if err := survey.AskOne(&survey.Input{Message: "Enter your choice:", Default: defaults[currentMode[1]]}, &mode, survey.WithValidator(func(v interface{}) error {
-		if _, ok := choices[fmt.Sprint(v)]; !ok {
+	mode, err := tunnelPrompt("Enter your choice", defaults[currentMode[1]], false, func(v string) error {
+		if _, ok := choices[v]; !ok {
 			return fmt.Errorf("choose 1, 2 or 3")
 		}
 		return nil
-	})); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
 	mode = choices[mode]
-	var err error
 	result[0].content, err = withTunnelOption(result[0].content, "--raw-mode", mode)
 	if err != nil {
 		return nil, err
@@ -454,14 +489,26 @@ func managePortPair(directory string, adding bool) error {
 	}
 	sort.Strings(options)
 	options = append(options, "Back")
-	var selected string
 	message := "Select tunnel to edit (ports, password, raw mode and remote address):"
 	if adding {
 		message = "Select existing configuration as template for an additional port:"
 	}
-	if err := survey.AskOne(&survey.Select{Message: message, Options: options}, &selected); err != nil {
+	fmt.Printf("\033[92m%s\033[0m\n", message)
+	for i, option := range options {
+		fmt.Printf("%d. %s\n", i+1, option)
+	}
+	selection, err := tunnelPrompt("Enter your choice", "", false, func(v string) error {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > len(options) {
+			return fmt.Errorf("choose 1-%d", len(options))
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
+	n, _ := strconv.Atoi(selection)
+	selected := options[n-1]
 	if selected == "Back" {
 		return nil
 	}
@@ -487,14 +534,14 @@ func managePortPair(directory string, adding bool) error {
 		}
 	}
 	promptPort := func(label string, current *int) error {
-		var value string
-		if err := survey.AskOne(&survey.Input{Message: label, Default: strconv.Itoa(*current)}, &value, survey.WithValidator(func(v interface{}) error {
-			n, err := strconv.Atoi(fmt.Sprint(v))
+		value, err := tunnelPrompt(strings.TrimSuffix(label, ":"), strconv.Itoa(*current), false, func(v string) error {
+			n, err := strconv.Atoi(v)
 			if err != nil || n < 1 || n > 65535 {
 				return fmt.Errorf("enter a port from 1 to 65535")
 			}
 			return nil
-		})); err != nil {
+		})
+		if err != nil {
 			return err
 		}
 		*current, _ = strconv.Atoi(value)
@@ -503,12 +550,9 @@ func managePortPair(directory string, adding bool) error {
 	if err := promptPort("Tunnel port (use the same value on Iran and Outside):", &tunnel); err != nil {
 		return err
 	}
-	working := before
-	if !adding {
-		working, err = editTunnelPassword(before)
-		if err != nil {
-			return err
-		}
+	working, err := editTunnelPassword(before)
+	if err != nil {
+		return err
 	}
 	label := "WireGuard destination UDP port on this server:"
 	if iran {
@@ -530,11 +574,9 @@ func managePortPair(directory string, adding bool) error {
 	if err != nil {
 		return err
 	}
-	if !adding {
-		after, err = editTunnelDetails(after, iran)
-		if err != nil {
-			return err
-		}
+	after, err = editTunnelDetails(after, iran)
+	if err != nil {
+		return err
 	}
 	if adding {
 		after, err = nextPortPair(directory, after)
@@ -552,11 +594,16 @@ func managePortPair(directory string, adding bool) error {
 		host, _, _ := unitEndpoint(unit.content, "r")
 		fmt.Printf("%s: listen %d -> %s\n", unit.name, l, net.JoinHostPort(host, strconv.Itoa(r)))
 	}
-	var confirm bool
-	if err := survey.AskOne(&survey.Confirm{Message: "Save changes and restart this tunnel? (automatic rollback on failure)", Default: false}, &confirm); err != nil {
+	confirm, err := tunnelPrompt("Save changes and restart this tunnel? (y/N)", "N", false, func(v string) error {
+		if v != "y" && v != "Y" && v != "n" && v != "N" {
+			return fmt.Errorf("enter y or n")
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	if !confirm {
+	if confirm != "y" && confirm != "Y" {
 		return nil
 	}
 	run := func(args ...string) error {
