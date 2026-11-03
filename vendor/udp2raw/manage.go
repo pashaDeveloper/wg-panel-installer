@@ -527,7 +527,11 @@ func managePortPair(directory string, adding bool) error {
 		fmt.Printf("\033[92m    Config: %s\033[0m\n", selected)
 	}
 	fmt.Println("\033[93m────────────────────────────────────────\033[0m")
-	fmt.Println("Enter keeps each current value. Password stays hidden.")
+	if adding {
+		fmt.Println("Enter the ports for the NEW service. Use free listen ports; existing services keep their ports. Password stays hidden.")
+	} else {
+		fmt.Println("Enter keeps each current value. Password stays hidden.")
+	}
 	_, listen, _ := unitEndpoint(before[0].content, "l")
 	_, remote, _ := unitEndpoint(before[0].content, "r")
 	tunnel, wireguard, fec := listen, remote, 0
@@ -542,7 +546,11 @@ func managePortPair(directory string, adding bool) error {
 		}
 	}
 	promptPort := func(label string, current *int) error {
-		value, err := tunnelPrompt(strings.TrimSuffix(label, ":"), strconv.Itoa(*current), false, func(v string) error {
+		fallback := strconv.Itoa(*current)
+		if adding {
+			fallback = ""
+		}
+		value, err := tunnelPrompt(strings.TrimSuffix(label, ":"), fallback, false, func(v string) error {
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 1 || n > 65535 {
 				return fmt.Errorf("enter a port from 1 to 65535")
